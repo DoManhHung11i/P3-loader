@@ -1,0 +1,97 @@
+Mục đích chính: kết nối trực tiếp giữa 2 thiết bị nằm ở mạng khác nhau
+Các chức năng chính:
+- Port forward: map 1 cổng dịch vụ ở máy đích ra 1 cổng lắng nghe local ở máy nguồn
+- Tự động phát hiện loại NAT: bằng cách gửi UDP/TCP tới server ở 2 port khác nhau và so sánh port ánh xạ ra ngoài
+- SDWAN: biến các node thành 1 mạng LAN ảo 
+Các case hoạt động:
+- 2 máy chung mạng LAN: kết nối trực tiếp qua IP LAN nội bộ
+- 2 máy đều có IPv6: kết nối trực tiếp qua địa chỉ IPv6 công cộng
+- 1 trong 2 máy có IP Public thật: máy có IP Public đóng vai trò server, máy còn lại connect trực tiếp với IP:Port đo
+- Cả 2 máy đều sau: 
+ + Mỗi client tự phát hiện loại NAT của mình
+ + Gửi thông tin lên server
+ + Server đồng bộ thời gian và ra lệnh cho 2 bên đồng thời gửi gói tin tới địa chỉ NAT dự đoán của nhau
+- Puch thất bại:
+ + Client gửi yêu cầu MsgRelayNodeReq lên server để xin 1 share node
+ + Server cấp token TOTP tạm thời và tên node relay
+ + Client dựng tunnel P2P tới node relay (dùng các cơ chế trên)
+- Sau khi trao đổi NAT info, thử lần lượt Intranet -> IPv6 -> IPv4 direct -> UDP Punch -> TCP Punch -> Relay
+
+1. Setup
+- Nếu có subcommand (install/uninstall/start/stop) -> xử lý riêng rồi thoát
+- parseParam -> đọc CLI/config.json 
+- Nếu có -d -> spawn + giám sát worker process con (loop forever)
+- else (worker thật)
+ + setfirewall
+ + P2PNetworkInstance + GNetwork.Connect
+ + block forever
+
+2. Kết nối tới server
+
+- Cấu trúc gói tin:
++ Header (8 bytes: Độ dài phần body + Main type + sub type) + body
++ Main type:
+	* MsgLogin = 0: đăng nhập vào server
+	* MsgHearbear = 1: giữ kết sống online + đồng bộ thời gian
+	* MsgNATDetect = 2: dò loại NAT
+	* MsgPush = 3: server chuyển tiếp message từ client A sang B (signaling)
+	* MsgP2P = 4: dữ liệu chạy trên tunnel P2P đã thiết lập
+	* MsgRelay = 5: xin/relay qua node trung gian
+	* MsgReport = 6: client báo cáo trạng thái lên server
+	* MsgQuery = 7: client hỏi server thông tin
+	* MsgSDWAN = 8: liên quan mạng ảo SDWAN
+	* MsgPush: cơ chế signaling qua server - client A không nói chuyện trực tiếp được với client B, nên A gửi MsgPush lên server, server nhìn PushHeader (gồm nodeID người gửi và nodeID người nhận), forward nguyên xi gói đó sang kết nối WebSocket của B. Server chỉ đọc From/To để định tuyến (thực ra JSON body vẫn ở dạng cleartext qua TLS tới server nhưng server chỉ đóng vai trò forward theo thiết kế)
+ + Sub type của MsgPush -  các bước trong quy trình bắt tay giữa 2 client:
+	* MsgPushConnectReq = 1: A yêu cầu kết nối tới B
+	* MsgPusConnectRsp = 2: B trả lời (đồng ý + thông tin NAT của B)
+	* MsgPushAddRelayTunnelReq = 4: A yêu cầu B cùng dùng relay node
+	* MsgPushAddRelayTunnelRsp = 5: 
+	* MsgPushupdate = 6: server ra lệnh client tự update
+	* MsgPushEditApp = 9: server đẩy lệnh sửa app
+	* MsgPushRestart = 11: server ra lệnh client restart
+ + Sub type của MsgP2P - giao thức bên trong tunnel đã thiết lập:
+	* MsgPunchHandshake = 0: gói dùng dể hole punch NAT
+	* MsgTunnelHandshake = 2: bắt tay thiết lập tunnel (sau khi đã punch xong)
+	* MsgTunnelHeartbeat = 4: giữ tunnel sống
+	* MsgOverlayConnectReq = 6: yêu cầu mở kết nối tới dịch vụ đích
+	* MsgRelayData = 10: dữ lieeyj được đống gói để di qua relay node
+	* MsgNodeData = 13: dữ liệu thô của app
+	* MsgNodeDataNP = 15: dữ liệu IP packet cho chế độ SDWAN
+- Login vào server:
+ + Gử NAT type, node name, token
+ + Sau khi dial thành công, khởi động các goroutine nền: đọc msg liên tục, báo cáo info host lên server, tự động chạy các P2P app đã cấu hình
+ + Nếu node có vai trò làm trung gian: tìm tunnel đang có tới node đích và forward 
+- Luồng xin relaynode: 
+ + A xin server cấp 1 relay node 
+ + A tự dựng tunnel P2P thật sự tới relay đó
+ + A báo cho B (qua Push) "tao dùng relay X với tunnel ID Y, mày cũng dựng tunnel tới X đi" → B xác nhận
+ + A và B mỗi bên có một tunnel tới relay, relay forward giữa 2 tunnel đó
+- Khi cần connect tới node B: hỏi server B online chưa -> gửi trực tiếp cho B qua server qua server forward (PushConnectReq) -> chờ B trả lời (PushConnectRsp)
+
+3. Xác định NAT và hole punching
+- Phát hiện NAT: client dùng cùng 1 local port để gửi 2 gói UDP (fallback về TCP) tới 2 port khác nhau trên server
+- Kiểm tra máy cso IP public thật hoặc UPnP không:
+ + Server được yêu cầu gửi thẳng 1 gói UDP tới IP:port public của client, nếu client nhận được chứng tỏ port đó đã mở sẵn từ ngoài internet vào mà không cần làm gì -> máy có IP public thật
+ + Chủ động gọi UPnP để yêu cầu router tự mở port	
+- NAT punching:
+ + C2C: cả 2 bên đồng thời gửi gói UDP tới địa chỉ NAT của nhau
+ + C2S: Gửi nhiều gói UDP tới các port ngẫu nhiên trên peer
+ + S2C: mở nhiều port khác nhau
+
+4. P2P tunnel
+- Sau khi đã khoét lỗ:
+ + Chọn đúng loại underlay: IP public/UPnP/Intranet/TCP punch -> TCP, UDP punch -> QUIC
+ + Dựng xong connnection, mở 2 luồng chạy mãi mãi: readLoop + writeLoop
+
+5. Ứng dụng Port Forward
+- Nhận kết nối TCP local -> tạo overlayConn
+- Gửi overlayconnectReq qua tunnel
+- Máy đích nhận req: tự dial TCP vào localhost:dstPort -> tạo overlayconn phía target, trả lời overlatconnectRsp
+- 2 overlayConn bắt đầu gửi dữ liệu qua tunnel
+
+6. SDWAN: biến nhiều máy ở nhiều nơi khác nhau thành một mạng LAN ảo chung
+- Server cấp cấu hình SDWAN xuống client (danh sách node + IP ảo + resource - subnet thật đứng sau nó)
+- Máy mình tạo card ảo, gán IP ảo, thêm route hệ điều hành trỏ vào card đó, máy khác thì chỉ lưu vào bảng IP ảo -> tên node
+- Với mỗi node có ID nhỏ hơn mình -> dựng P2P tunnel
+- Ghi gõ ping IP, OS thấy route trỏ IP đó qua card ảo, đẩy gói ping vào card ảo, OpenP2P đọc được gói này, trả bảng ra node B -> gửi qua tunnel P2P
+- Phía node B nhận được đẩy thnawgf vào card ảo của B -> OS coi đây là gói tin bình thường tự xử lý và trả lời theo đường ngược lại
